@@ -1,0 +1,1 @@
+python src/roi_extractor.py data/raw/495.MOV --skin ycrcb --forehead-height 0.22 --forehead-inset 0.12 --cheek-bottom-frac 0.35 --cheek-shrink 0.22
