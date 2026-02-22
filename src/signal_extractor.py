@@ -1,55 +1,85 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from dataclasses import dataclass
+from scipy.signal import butter, filtfilt, welch, detrend, windows
 
-from scipy.signal import butter, filtfilt, welch, detrend
+# =============================
+# Config
+# =============================
+@dataclass
+class RPPGConfig:
+    f_lo: float = 0.7          # Hz
+    f_hi: float = 4.0          # Hz
+    bp_order: int = 3
+    pos_win_sec: float = 1.6
+    pos_overlap: float = 0.5   # hop = win*(1-overlap)
+    hr_win_sec: float = 10.0
+    hr_hop_sec: float = 1.0
+    min_valid_ratio: float = 0.7  # minimum fraction of finite samples required
+    snr_guard_hz: float = 0.15    # "peak neighborhood" for SNR numerator
+    snr_min_db: float = 0.0       # reject window if SNR below this
 
-# -----------------------------
+CFG = RPPGConfig()
+
+# =============================
 # Utilities
-# -----------------------------
-def interp_nans(x: np.ndarray) -> np.ndarray:
-    """Linear-interpolate NaNs in a 1D array."""
-    x = x.astype(float)
+# =============================
+def interp_nans_1d(x: np.ndarray, min_valid_ratio=0.7) -> np.ndarray:
+    """Linear-interpolate NaNs in 1D; if too many NaNs -> return all-NaN."""
+    x = np.asarray(x, float)
     n = len(x)
-    t = np.arange(n)
     good = np.isfinite(x)
-    if good.sum() < max(5, n // 10):
+    if good.mean() < min_valid_ratio:
         return np.full_like(x, np.nan)
-    x2 = x.copy()
-    x2[~good] = np.interp(t[~good], t[good], x[good])
-    return x2
+    if good.all():
+        return x
+    t = np.arange(n)
+    y = x.copy()
+    y[~good] = np.interp(t[~good], t[good], x[good])
+    return y
 
-def bandpass(x, fs, f_lo=0.7, f_hi=4.0, order=3):
-    """Zero-phase Butterworth bandpass."""
-    nyq = 0.5 * fs
-    b, a = butter(order, [f_lo/nyq, f_hi/nyq], btype="band")
-    return filtfilt(b, a, x)
-
-def zscore(x):
+def zscore(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, float)
     mu = np.nanmean(x)
     sd = np.nanstd(x) + 1e-12
     return (x - mu) / sd
 
-# -----------------------------
+def bandpass(x: np.ndarray, fs: float, f_lo: float, f_hi: float, order: int) -> np.ndarray:
+    """Zero-phase Butterworth bandpass."""
+    x = np.asarray(x, float)
+    nyq = 0.5 * fs
+    b, a = butter(order, [f_lo/nyq, f_hi/nyq], btype="band")
+    return filtfilt(b, a, x)
+
+def safe_detrend(x):
+    x = np.asarray(x, float)
+    if not np.all(np.isfinite(x)):
+        return x
+    return detrend(x, type="linear")
+
+# =============================
 # rPPG methods
-# -----------------------------
-def rppg_green(rgb, fs):
-    """Simplest baseline: use G channel only."""
-    g = interp_nans(rgb[:, 1])
-    g = detrend(g, type='linear')
-    return bandpass(g, fs)
+# =============================
+def rppg_green(rgb: np.ndarray, fs: float, cfg: RPPGConfig = CFG) -> np.ndarray:
+    """Baseline: green channel bandpassed."""
+    g = interp_nans_1d(rgb[:, 1], cfg.min_valid_ratio)
+    if not np.all(np.isfinite(g)):
+        return np.full(len(g), np.nan)
+    g = safe_detrend(g)
+    return bandpass(g, fs, cfg.f_lo, cfg.f_hi, cfg.bp_order)
 
-def rppg_chrom(rgb, fs):
+def rppg_chrom(rgb: np.ndarray, fs: float, cfg: RPPGConfig = CFG) -> np.ndarray:
     """
-    CHROM method (De Haan & Jeanne).
-    Works best with decent lighting, stable ROI.
+    CHROM (De Haan & Jeanne).
+    Normalize channels, form X/Y, then combine.
     """
-    R = interp_nans(rgb[:, 0])
-    G = interp_nans(rgb[:, 1])
-    B = interp_nans(rgb[:, 2])
+    R = interp_nans_1d(rgb[:, 0], cfg.min_valid_ratio)
+    G = interp_nans_1d(rgb[:, 1], cfg.min_valid_ratio)
+    B = interp_nans_1d(rgb[:, 2], cfg.min_valid_ratio)
+    if not (np.all(np.isfinite(R)) and np.all(np.isfinite(G)) and np.all(np.isfinite(B))):
+        return np.full(len(R), np.nan)
 
-    # Normalize (remove intensity scale)
     Rn = R / (np.mean(R) + 1e-12)
     Gn = G / (np.mean(G) + 1e-12)
     Bn = B / (np.mean(B) + 1e-12)
@@ -57,206 +87,234 @@ def rppg_chrom(rgb, fs):
     X = 3*Rn - 2*Gn
     Y = 1.5*Rn + Gn - 1.5*Bn
 
-    X = detrend(X, type='linear')
-    Y = detrend(Y, type='linear')
+    X = bandpass(safe_detrend(X), fs, cfg.f_lo, cfg.f_hi, cfg.bp_order)
+    Y = bandpass(safe_detrend(Y), fs, cfg.f_lo, cfg.f_hi, cfg.bp_order)
 
-    Xf = bandpass(X, fs)
-    Yf = bandpass(Y, fs)
-
-    alpha = np.std(Xf) / (np.std(Yf) + 1e-12)
-    S = Xf - alpha * Yf
+    alpha = np.std(X) / (np.std(Y) + 1e-12)
+    S = X - alpha * Y
     return zscore(S)
 
-def rppg_pos(rgb, fs, win_sec=1.6):
+def rppg_pos(rgb: np.ndarray, fs: float, cfg: RPPGConfig = CFG) -> np.ndarray:
     """
-    POS method (Wang et al.) – sliding window projection.
-    Often very robust.
+    POS (Wang et al.).
+    Efficient overlap-add (hop > 1) instead of sliding by 1 sample.
     """
-    R = interp_nans(rgb[:, 0])
-    G = interp_nans(rgb[:, 1])
-    B = interp_nans(rgb[:, 2])
-    C = np.vstack([R, G, B]).T.astype(float)
+    R = interp_nans_1d(rgb[:, 0], cfg.min_valid_ratio)
+    G = interp_nans_1d(rgb[:, 1], cfg.min_valid_ratio)
+    B = interp_nans_1d(rgb[:, 2], cfg.min_valid_ratio)
+    if not (np.all(np.isfinite(R)) and np.all(np.isfinite(G)) and np.all(np.isfinite(B))):
+        return np.full(len(R), np.nan)
 
-    # Normalize per channel globally (simple, works ok)
+    C = np.vstack([R, G, B]).T.astype(float)
     C = C / (np.mean(C, axis=0, keepdims=True) + 1e-12)
 
     n = len(C)
-    win = int(round(win_sec * fs))
-    win = max(win, 5)
-    S = np.zeros(n, float)
+    win = max(5, int(round(cfg.pos_win_sec * fs)))
+    hop = max(1, int(round(win * (1.0 - cfg.pos_overlap))))
+    hann = windows.hann(win, sym=False)
 
-    for t0 in range(0, n - win + 1):
-        Cw = C[t0:t0+win]
-        Cw = Cw - np.mean(Cw, axis=0, keepdims=True)
+    out = np.zeros(n, float)
+    wsum = np.zeros(n, float)
 
-        # POS projection
-        X = Cw @ np.array([[0, 1, -1],
-                           [-2, 1, 1]], float).T   # shape (win,2)
+    P = np.array([[0,  1, -1],
+                  [-2, 1,  1]], dtype=float)  # 2x3
+
+    for start in range(0, n - win + 1, hop):
+        seg = C[start:start+win]
+        seg = seg - np.mean(seg, axis=0, keepdims=True)
+        X = seg @ P.T  # (win,2)
 
         x1 = X[:, 0]
         x2 = X[:, 1]
         alpha = np.std(x1) / (np.std(x2) + 1e-12)
         s = x1 - alpha * x2
+        s = s - np.mean(s)
 
-        S[t0:t0+win] += s
+        out[start:start+win] += s * hann
+        wsum[start:start+win] += hann
 
-    S = detrend(S, type='linear')
-    S = bandpass(S, fs)
-    return zscore(S)
+    out = out / np.maximum(wsum, 1e-12)
+    out = bandpass(safe_detrend(out), fs, cfg.f_lo, cfg.f_hi, cfg.bp_order)
+    return zscore(out)
 
-# -----------------------------
-# HR estimation
-# -----------------------------
-def hr_fft(rppg, fs, f_lo=0.7, f_hi=4.0):
-    """Single HR estimate from full segment using Welch peak."""
-    rppg = np.asarray(rppg, float)
-    if not np.all(np.isfinite(rppg)):
-        return np.nan, (None, None)
+# =============================
+# HR + Quality metrics
+# =============================
+def welch_hr_and_snr(x: np.ndarray, fs: float, cfg: RPPGConfig = CFG):
+    """
+    Returns bpm, snr_db, freqs, psd.
+    SNR is computed as:
+      10*log10( power around peak / power in band excluding that neighborhood )
+    """
+    x = np.asarray(x, float)
+    if not np.all(np.isfinite(x)):
+        return np.nan, -np.inf, None, None
 
-    f, pxx = welch(rppg, fs=fs, nperseg=min(len(rppg), int(8*fs)))
-    band = (f >= f_lo) & (f <= f_hi)
+    f, p = welch(x, fs=fs, nperseg=min(len(x), int(8*fs)))
+    band = (f >= cfg.f_lo) & (f <= cfg.f_hi)
     if band.sum() < 3:
-        return np.nan, (f, pxx)
+        return np.nan, -np.inf, f, p
 
-    f_band = f[band]
-    p_band = pxx[band]
-    f0 = f_band[np.argmax(p_band)]
+    fb = f[band]
+    pb = p[band]
+    i0 = int(np.argmax(pb))
+    f0 = float(fb[i0])
     bpm = 60.0 * f0
-    return bpm, (f, pxx)
 
-def hr_track_sliding(rppg, fs, win_sec=10.0, hop_sec=1.0, f_lo=0.7, f_hi=4.0):
-    """Time-varying HR track with sliding Welch."""
-    n = len(rppg)
-    win = int(round(win_sec * fs))
-    hop = int(round(hop_sec * fs))
-    times = []
-    bpms = []
+    # SNR in-band
+    guard = cfg.snr_guard_hz
+    num = (fb >= f0-guard) & (fb <= f0+guard)
+    den = ~num
+    p_num = float(np.sum(pb[num]) + 1e-12)
+    p_den = float(np.sum(pb[den]) + 1e-12)
+    snr_db = 10.0 * np.log10(p_num / p_den)
 
-    for start in range(0, n - win + 1, hop):
-        seg = rppg[start:start+win]
-        bpm, _ = hr_fft(seg, fs, f_lo, f_hi)
+    return bpm, snr_db, f, p
+
+def hr_track_sliding(x: np.ndarray, fs: float, cfg: RPPGConfig = CFG):
+    win = int(round(cfg.hr_win_sec * fs))
+    hop = int(round(cfg.hr_hop_sec * fs))
+    times, bpms, snrs = [], [], []
+    for start in range(0, len(x) - win + 1, hop):
+        seg = x[start:start+win]
+        bpm, snr_db, _, _ = welch_hr_and_snr(seg, fs, cfg)
         times.append((start + win/2) / fs)
-        bpms.append(bpm)
+        bpms.append(bpm if snr_db >= cfg.snr_min_db else np.nan)
+        snrs.append(snr_db)
+    return np.array(times), np.array(bpms), np.array(snrs)
 
-    return np.array(times), np.array(bpms)
-
-# -----------------------------
-# Main analysis
-# -----------------------------
+# =============================
+# IO + Analysis
+# =============================
 def load_npz(npz_path: str):
     d = np.load(npz_path, allow_pickle=True)
-    fps = float(d["fps"]) if "fps" in d else 30.0
-    ts = d["timestamps"] if "timestamps" in d else np.arange(len(d["forehead"])) / fps
+    fs = float(d["fps"]) if "fps" in d else 30.0
+    ts = d["timestamps"].astype(float) if "timestamps" in d else np.arange(len(d["forehead"])) / fs
 
     rois = {}
     for k in ["forehead", "left_cheek", "right_cheek"]:
         if k in d:
-            rois[k] = d[k].astype(float)  # shape (T,3) as (R,G,B)
-    return fps, ts, rois
+            rois[k] = d[k].astype(float)  # (T,3) RGB
+    # optional quality extras from improved extractor
+    roi_pixels = d["roi_pixels"] if "roi_pixels" in d else None
+    face_ok = d["face_ok"] if "face_ok" in d else None
+    return fs, ts, rois, roi_pixels, face_ok
 
-def analyze_one(npz_path: str, method="POS", show=True):
-    fs, t, rois = load_npz(npz_path)
-    out = {}
-
+def analyze_one(npz_path: str, method="POS", cfg: RPPGConfig = CFG, show=True, save_dir=None):
+    fs, t, rois, roi_pixels, face_ok = load_npz(npz_path)
     method = method.upper()
-    rppg_fn = {
-        "GREEN": rppg_green,
-        "CHROM": rppg_chrom,
-        "POS": rppg_pos,
-    }[method]
+    rppg_fn = {"GREEN": rppg_green, "CHROM": rppg_chrom, "POS": rppg_pos}[method]
 
+    results = {}
     for roi_name, rgb in rois.items():
-        # Raw channels (handle NaNs)
-        R = interp_nans(rgb[:,0]); G = interp_nans(rgb[:,1]); B = interp_nans(rgb[:,2])
+        s = rppg_fn(rgb, fs, cfg)
 
-        # rPPG
-        s = rppg_fn(rgb, fs)
+        bpm, snr_db, f, pxx = welch_hr_and_snr(s, fs, cfg)
+        tt, bpm_track, snr_track = hr_track_sliding(s, fs, cfg)
 
-        # HR full + PSD
-        bpm, (f, pxx) = hr_fft(s, fs)
+        results[roi_name] = dict(
+            t=t, rgb=rgb, rppg=s,
+            bpm=bpm, snr_db=snr_db,
+            f=f, pxx=pxx,
+            hr_t=tt, hr_bpm=bpm_track, hr_snr_db=snr_track
+        )
 
-        # HR track
-        tt, bpm_track = hr_track_sliding(s, fs, win_sec=10.0, hop_sec=1.0)
+        if show or save_dir:
+            title = f"{Path(npz_path).name} | ROI={roi_name} | {method} | HR≈{bpm:.1f} bpm | SNR≈{snr_db:.1f} dB"
 
-        out[roi_name] = {
-            "t": t, "rgb": np.vstack([R,G,B]).T, "rppg": s,
-            "bpm": bpm, "f": f, "pxx": pxx,
-            "hr_t": tt, "hr_bpm": bpm_track
-        }
-
-        if show:
-            fig = plt.figure(figsize=(12, 8))
-            fig.suptitle(f"{Path(npz_path).name} | ROI={roi_name} | method={method} | HR≈{bpm:.1f} bpm")
-
-            ax1 = plt.subplot(3,1,1)
-            ax1.plot(t, R, label="R")
-            ax1.plot(t, G, label="G")
-            ax1.plot(t, B, label="B")
-            ax1.set_ylabel("Mean RGB")
-            ax1.legend(loc="upper right")
-            ax1.grid(True, alpha=0.3)
-
-            ax2 = plt.subplot(3,1,2)
-            ax2.plot(t, s)
-            ax2.set_ylabel("rPPG (bandpassed)")
-            ax2.set_xlabel("Time (s)")
-            ax2.grid(True, alpha=0.3)
-
-            ax3 = plt.subplot(3,2,5)
-            ax3.plot(f, pxx)
-            ax3.set_xlim(0, 6)
-            ax3.set_xlabel("Frequency (Hz)")
-            ax3.set_ylabel("PSD")
-            ax3.grid(True, alpha=0.3)
-
-            ax4 = plt.subplot(3,2,6)
-            ax4.plot(tt, bpm_track)
-            ax4.set_xlabel("Time (s)")
-            ax4.set_ylabel("HR (bpm)")
-            ax4.set_ylim(40, 200)
-            ax4.grid(True, alpha=0.3)
-
+            # 1) RGB
+            plt.figure(figsize=(10, 3))
+            plt.plot(t, interp_nans_1d(rgb[:,0], cfg.min_valid_ratio), label="R")
+            plt.plot(t, interp_nans_1d(rgb[:,1], cfg.min_valid_ratio), label="G")
+            plt.plot(t, interp_nans_1d(rgb[:,2], cfg.min_valid_ratio), label="B")
+            plt.title("Raw ROI mean RGB — " + roi_name)
+            plt.xlabel("Time (s)")
+            plt.ylabel("Mean intensity (a.u.)")
+            plt.legend(ncol=3, fontsize=8)
             plt.tight_layout()
-            plt.show()
+            if save_dir:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                plt.savefig(Path(save_dir)/f"rgb_{roi_name}.png", dpi=200)
+            if show: plt.show()
+            else: plt.close()
 
-    return out
+            # 2) rPPG waveform
+            plt.figure(figsize=(10, 3))
+            plt.plot(t, s)
+            plt.title("rPPG (bandpassed) — " + title)
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude (z)")
+            plt.tight_layout()
+            if save_dir:
+                plt.savefig(Path(save_dir)/f"rppg_{roi_name}.png", dpi=200)
+            if show: plt.show()
+            else: plt.close()
 
-def analyze_folder(folder="data/processed", method="POS"):
+            # 3) PSD
+            if f is not None:
+                plt.figure(figsize=(10, 3))
+                plt.semilogy(f, pxx)
+                plt.xlim(0, 6)
+                plt.title("Welch PSD — " + title)
+                plt.xlabel("Frequency (Hz)")
+                plt.ylabel("PSD")
+                plt.tight_layout()
+                if save_dir:
+                    plt.savefig(Path(save_dir)/f"psd_{roi_name}.png", dpi=200)
+                if show: plt.show()
+                else: plt.close()
+
+            # 4) HR track + SNR track (separate figures)
+            plt.figure(figsize=(10, 3))
+            plt.plot(tt, bpm_track)
+            plt.ylim(40, 200)
+            plt.title("HR track (Welch windows) — " + roi_name)
+            plt.xlabel("Time (s)")
+            plt.ylabel("HR (bpm)")
+            plt.tight_layout()
+            if save_dir:
+                plt.savefig(Path(save_dir)/f"hr_{roi_name}.png", dpi=200)
+            if show: plt.show()
+            else: plt.close()
+
+            plt.figure(figsize=(10, 3))
+            plt.plot(tt, snr_track)
+            plt.title("Quality track: SNR(dB) — " + roi_name)
+            plt.xlabel("Time (s)")
+            plt.ylabel("SNR (dB)")
+            plt.tight_layout()
+            if save_dir:
+                plt.savefig(Path(save_dir)/f"snr_{roi_name}.png", dpi=200)
+            if show: plt.show()
+            else: plt.close()
+
+    # Best ROI selection (use SNR, then bpm validity)
+    best = None
+    best_score = -np.inf
+    for roi_name, d in results.items():
+        score = d["snr_db"]
+        if np.isfinite(d["bpm"]) and score > best_score:
+            best_score = score
+            best = roi_name
+
+    if best is not None:
+        print(f"Best ROI by SNR: {best} | HR≈{results[best]['bpm']:.1f} bpm | SNR≈{results[best]['snr_db']:.1f} dB | fs={fs:.2f}")
+
+    return results
+
+def analyze_folder(folder="data/processed", method="POS", cfg: RPPGConfig = CFG):
     folder = Path(folder)
     files = sorted(folder.glob("*.npz"))
     if not files:
         print("No .npz files found in", folder)
         return
 
-    summary = []
+    print(f"Found {len(files)} files in {folder}")
     for f in files:
-        out = analyze_one(str(f), method=method, show=False)
-        # pick best ROI = highest PSD peak in band (simple heuristic)
-        best_roi = None
-        best_score = -np.inf
-        best_bpm = np.nan
-
-        for roi_name, d in out.items():
-            ff, pxx = d["f"], d["pxx"]
-            if ff is None: 
-                continue
-            band = (ff >= 0.7) & (ff <= 4.0)
-            score = np.max(pxx[band]) if band.any() else -np.inf
-            if score > best_score:
-                best_score = score
-                best_roi = roi_name
-                best_bpm = d["bpm"]
-
-        summary.append((f.name, best_roi, best_bpm))
-
-    print("\nSummary (best ROI per file):")
-    for name, roi, bpm in summary:
-        print(f"  {name:30s}  best={roi:12s}  HR≈{bpm:6.1f} bpm")
+        res = analyze_one(str(f), method=method, cfg=cfg, show=False, save_dir=None)
+        # Best already printed
 
 # ---- Example usage ----
 if __name__ == "__main__":
-    # analyze one file with plots:
-    analyze_one("data/processed/508_ppg_data.npz", method="POS", show=True)
-
-    # analyze all .npz in folder without plots:
-    #analyze_folder("data/processed", method="POS")
+    analyze_one("data/processed/1_ppg_data.npz", method="GREEN", show=True, save_dir=None)
+    # analyze_folder("data/processed", method="POS")
